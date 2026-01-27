@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, Method, Response, StatusCode, Uri},
+    http::{header, HeaderMap, Method, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::{delete, get, head, post, put},
     Router,
@@ -19,6 +19,22 @@ use crate::error::{ErrorCode, StorageError, StorageResult};
 use crate::handlers;
 use crate::storage::{ExtentStore, MetadataStore};
 
+/// Converts an error response for HEAD requests by removing the body.
+/// HEAD responses must not have a body, so we keep headers but set empty body.
+fn error_response_for_method(error: StorageError, method: &Method, request_id: &str) -> Response<Body> {
+    let response = error.with_request_id(request_id).into_response();
+
+    if method == Method::HEAD {
+        // For HEAD requests, remove the body but keep headers
+        let (mut parts, _) = response.into_parts();
+        // Remove content-length header since there's no body
+        parts.headers.remove(header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::empty())
+    } else {
+        response
+    }
+}
+
 /// Application state shared between handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +49,7 @@ pub fn create_router(state: AppState) -> Router {
         // Service-level routes (no container/blob)
         .route("/", get(service_handler).put(service_handler).post(service_handler).head(service_handler))
         .route("/:account", get(service_handler).put(service_handler).post(service_handler).head(service_handler))
+        .route("/:account/", get(service_handler).put(service_handler).post(service_handler).head(service_handler))
         // Container-level routes
         .route("/:account/:container", get(container_handler).put(container_handler).delete(container_handler).head(container_handler).post(container_handler))
         // Blob-level routes (with catch-all for blob path)
@@ -52,18 +69,18 @@ async fn service_handler(
 ) -> Response<Body> {
     let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
         Ok(ctx) => ctx,
-        Err(e) => return e.into_response(),
+        Err(e) => return error_response_for_method(e, &method, ""),
     };
 
     // Authenticate
     if let Err(e) = authenticate(&ctx, &state.config) {
-        return e.into_response();
+        return error_response_for_method(e, &method, &ctx.request_id);
     }
 
     let result = route_service_request(&ctx, &state, body).await;
     match result {
         Ok(response) => response,
-        Err(e) => e.with_request_id(&ctx.request_id).into_response(),
+        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
     }
 }
 
@@ -79,18 +96,18 @@ async fn container_handler(
 ) -> Response<Body> {
     let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
         Ok(ctx) => ctx,
-        Err(e) => return e.into_response(),
+        Err(e) => return error_response_for_method(e, &method, ""),
     };
 
     // Authenticate
     if let Err(e) = authenticate(&ctx, &state.config) {
-        return e.into_response();
+        return error_response_for_method(e, &method, &ctx.request_id);
     }
 
     let result = route_container_request(&ctx, &state, body).await;
     match result {
         Ok(response) => response,
-        Err(e) => e.with_request_id(&ctx.request_id).into_response(),
+        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
     }
 }
 
@@ -106,18 +123,18 @@ async fn blob_handler(
 ) -> Response<Body> {
     let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
         Ok(ctx) => ctx,
-        Err(e) => return e.into_response(),
+        Err(e) => return error_response_for_method(e, &method, ""),
     };
 
     // Authenticate
     if let Err(e) = authenticate(&ctx, &state.config) {
-        return e.into_response();
+        return error_response_for_method(e, &method, &ctx.request_id);
     }
 
     let result = route_blob_request(&ctx, &state, body).await;
     match result {
         Ok(response) => response,
-        Err(e) => e.with_request_id(&ctx.request_id).into_response(),
+        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
     }
 }
 
