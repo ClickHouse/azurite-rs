@@ -83,9 +83,9 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
             strip target/${{ matrix.target }}/release/azurite-rs
           else
-            docker run --rm -v "$PWD:/work" -w /work \
-              ghcr.io/cross-rs/${{ matrix.target }}:main \
-              ${{ matrix.target }}-strip target/${{ matrix.target }}/release/azurite-rs
+            # Use llvm-strip for cross-compiled binaries (works on any architecture)
+            sudo apt-get update && sudo apt-get install -y llvm
+            llvm-strip target/${{ matrix.target }}/release/azurite-rs
           fi
 
       - name: Package binary
