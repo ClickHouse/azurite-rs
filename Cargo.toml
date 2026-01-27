@@ -1,0 +1,40 @@
+[package]
+name = "azurite-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Azure Blob Storage emulator in Rust"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = { version = "0.31", features = ["serialize"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4"] }
+base64 = "0.21"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+bytes = "1.5"
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+dashmap = "5.5"
+regex = "1.10"
+percent-encoding = "2.3"
+url = "2.5"
+clap = { version = "4.4", features = ["derive"] }
+http = "1.0"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+mime = "0.3"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tempfile = "3.9"

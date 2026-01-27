@@ -1,0 +1,261 @@
+//! SharedKey authentication for Azure Blob Storage API.
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::collections::BTreeMap;
+
+use crate::config::Config;
+use crate::context::RequestContext;
+use crate::error::{ErrorCode, StorageError, StorageResult};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Validates SharedKey authentication.
+pub fn validate_shared_key(
+    ctx: &RequestContext,
+    config: &Config,
+) -> StorageResult<()> {
+    let auth_header = ctx
+        .header("authorization")
+        .ok_or_else(|| StorageError::new(ErrorCode::AuthenticationFailed))?;
+
+    // Parse "SharedKey account:signature" or "SharedKeyLite account:signature"
+    let (scheme, credentials) = auth_header
+        .split_once(' ')
+        .ok_or_else(|| StorageError::new(ErrorCode::AuthenticationFailed))?;
+
+    if scheme != "SharedKey" && scheme != "SharedKeyLite" {
+        return Err(StorageError::new(ErrorCode::AuthenticationFailed));
+    }
+
+    let (account, provided_signature) = credentials
+        .split_once(':')
+        .ok_or_else(|| StorageError::new(ErrorCode::AuthenticationFailed))?;
+
+    // Verify account matches
+    if account != ctx.account {
+        return Err(StorageError::new(ErrorCode::AuthorizationFailure));
+    }
+
+    // Get account key
+    let account_key = config
+        .get_account_key(account)
+        .ok_or_else(|| StorageError::new(ErrorCode::AuthorizationFailure))?;
+
+    // Compute expected signature
+    let string_to_sign = if scheme == "SharedKey" {
+        build_string_to_sign(ctx)?
+    } else {
+        build_string_to_sign_lite(ctx)?
+    };
+
+    let expected_signature = compute_signature(&string_to_sign, account_key)?;
+
+    // Compare signatures
+    if provided_signature != expected_signature {
+        tracing::debug!(
+            "Signature mismatch:\n  Expected: {}\n  Provided: {}\n  StringToSign: {:?}",
+            expected_signature,
+            provided_signature,
+            string_to_sign
+        );
+        return Err(StorageError::new(ErrorCode::AuthenticationFailed));
+    }
+
+    Ok(())
+}
+
+/// Builds the string-to-sign for SharedKey authentication.
+fn build_string_to_sign(ctx: &RequestContext) -> StorageResult<String> {
+    let mut parts = Vec::new();
+
+    // VERB
+    parts.push(ctx.method.as_str().to_uppercase());
+
+    // Content headers (must be in this exact order)
+    let content_headers = [
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-md5",
+        "content-type",
+    ];
+
+    for header in &content_headers {
+        let value = if *header == "content-length" {
+            // Content-Length should be empty string if 0 or not present
+            match ctx.content_length() {
+                Some(0) | None => String::new(),
+                Some(len) => len.to_string(),
+            }
+        } else {
+            ctx.header(header).unwrap_or("").to_string()
+        };
+        parts.push(value);
+    }
+
+    // Date header (use x-ms-date if present, otherwise Date)
+    let date = ctx
+        .header("x-ms-date")
+        .or_else(|| ctx.header("date"))
+        .unwrap_or("");
+    parts.push(date.to_string());
+
+    // Conditional headers
+    let conditional_headers = [
+        "if-modified-since",
+        "if-match",
+        "if-none-match",
+        "if-unmodified-since",
+        "range",
+    ];
+
+    for header in &conditional_headers {
+        parts.push(ctx.header(header).unwrap_or("").to_string());
+    }
+
+    // Canonicalized headers (x-ms-* headers)
+    parts.push(build_canonicalized_headers(ctx));
+
+    // Canonicalized resource
+    parts.push(build_canonicalized_resource(ctx));
+
+    Ok(parts.join("\n"))
+}
+
+/// Builds the string-to-sign for SharedKeyLite authentication.
+fn build_string_to_sign_lite(ctx: &RequestContext) -> StorageResult<String> {
+    let mut parts = Vec::new();
+
+    // VERB
+    parts.push(ctx.method.as_str().to_uppercase());
+
+    // Content-MD5
+    parts.push(ctx.header("content-md5").unwrap_or("").to_string());
+
+    // Content-Type
+    parts.push(ctx.header("content-type").unwrap_or("").to_string());
+
+    // Date (use x-ms-date if present)
+    let date = ctx
+        .header("x-ms-date")
+        .or_else(|| ctx.header("date"))
+        .unwrap_or("");
+    parts.push(date.to_string());
+
+    // Canonicalized headers
+    parts.push(build_canonicalized_headers(ctx));
+
+    // Canonicalized resource (simplified)
+    parts.push(build_canonicalized_resource_lite(ctx));
+
+    Ok(parts.join("\n"))
+}
+
+/// Builds canonicalized headers string.
+fn build_canonicalized_headers(ctx: &RequestContext) -> String {
+    let ms_headers = ctx.ms_headers();
+    if ms_headers.is_empty() {
+        return String::new();
+    }
+
+    ms_headers
+        .iter()
+        .map(|(name, value)| {
+            // Normalize header name to lowercase and trim whitespace from value
+            let normalized_value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{}:{}", name.to_lowercase(), normalized_value)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Builds canonicalized resource string for SharedKey.
+fn build_canonicalized_resource(ctx: &RequestContext) -> String {
+    let mut resource = format!("/{}", ctx.account);
+
+    // Add path
+    let path = ctx.uri.path();
+    // Remove account from path if present
+    let path = if let Some(stripped) = path.strip_prefix(&format!("/{}", ctx.account)) {
+        stripped
+    } else {
+        path
+    };
+    resource.push_str(path);
+
+    // Add query parameters (sorted alphabetically)
+    if !ctx.query_params.is_empty() {
+        let mut sorted_params: Vec<_> = ctx.query_params.iter().collect();
+        sorted_params.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (key, value) in sorted_params {
+            resource.push('\n');
+            resource.push_str(&key.to_lowercase());
+            resource.push(':');
+            resource.push_str(value);
+        }
+    }
+
+    resource
+}
+
+/// Builds canonicalized resource string for SharedKeyLite.
+fn build_canonicalized_resource_lite(ctx: &RequestContext) -> String {
+    let mut resource = format!("/{}", ctx.account);
+
+    // Add path
+    let path = ctx.uri.path();
+    let path = if let Some(stripped) = path.strip_prefix(&format!("/{}", ctx.account)) {
+        stripped
+    } else {
+        path
+    };
+    resource.push_str(path);
+
+    // Only add comp parameter for Lite
+    if let Some(comp) = ctx.query_param("comp") {
+        resource.push_str("?comp=");
+        resource.push_str(comp);
+    }
+
+    resource
+}
+
+/// Computes HMAC-SHA256 signature.
+fn compute_signature(string_to_sign: &str, account_key: &str) -> StorageResult<String> {
+    let key_bytes = BASE64.decode(account_key).map_err(|_| {
+        StorageError::with_message(
+            ErrorCode::InternalError,
+            "Invalid account key encoding",
+        )
+    })?;
+
+    let mut mac = HmacSha256::new_from_slice(&key_bytes).map_err(|_| {
+        StorageError::with_message(ErrorCode::InternalError, "Failed to create HMAC")
+    })?;
+
+    mac.update(string_to_sign.as_bytes());
+    let result = mac.finalize();
+
+    Ok(BASE64.encode(result.into_bytes()))
+}
+
+/// Computes the signature for a given string-to-sign (used for SAS generation).
+pub fn sign_string(string_to_sign: &str, account_key: &str) -> StorageResult<String> {
+    compute_signature(string_to_sign, account_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_signature() {
+        let key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let string_to_sign = "test string";
+        let signature = compute_signature(string_to_sign, key).unwrap();
+        assert!(!signature.is_empty());
+    }
+}
