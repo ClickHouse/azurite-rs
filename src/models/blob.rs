@@ -333,7 +333,13 @@ impl BlobModel {
     /// Creates a snapshot of this blob.
     pub fn create_snapshot(&self) -> Self {
         let mut snapshot = self.clone();
-        snapshot.snapshot = Utc::now().format("%Y-%m-%dT%H:%M:%S.%7fZ").to_string();
+        // Azure snapshot format: 2024-01-27T12:34:56.1234567Z (7 decimal places)
+        let now = Utc::now();
+        snapshot.snapshot = format!(
+            "{}.{:07}Z",
+            now.format("%Y-%m-%dT%H:%M:%S"),
+            now.timestamp_subsec_nanos() / 100  // Convert nanoseconds to 100-nanosecond units (7 digits)
+        );
         snapshot
     }
 }

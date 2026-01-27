@@ -2,6 +2,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hmac::{Hmac, Mac};
+use percent_encoding;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 
@@ -54,10 +55,11 @@ pub fn validate_shared_key(
 
     // Compare signatures
     if provided_signature != expected_signature {
-        tracing::debug!(
-            "Signature mismatch:\n  Expected: {}\n  Provided: {}\n  StringToSign: {:?}",
+        tracing::warn!(
+            "Signature mismatch:\n  Expected: {}\n  Provided: {}\n  StringToSign:\n{}\n  StringToSign (escaped): {:?}",
             expected_signature,
             provided_signature,
+            string_to_sign,
             string_to_sign
         );
         return Err(StorageError::new(ErrorCode::AuthenticationFailed));
@@ -95,11 +97,12 @@ fn build_string_to_sign(ctx: &RequestContext) -> StorageResult<String> {
         parts.push(value);
     }
 
-    // Date header (use x-ms-date if present, otherwise Date)
-    let date = ctx
-        .header("x-ms-date")
-        .or_else(|| ctx.header("date"))
-        .unwrap_or("");
+    // Date header - if x-ms-date is present, leave Date empty (x-ms-date is in canonicalized headers)
+    let date = if ctx.header("x-ms-date").is_some() {
+        ""
+    } else {
+        ctx.header("date").unwrap_or("")
+    };
     parts.push(date.to_string());
 
     // Conditional headers
@@ -115,13 +118,14 @@ fn build_string_to_sign(ctx: &RequestContext) -> StorageResult<String> {
         parts.push(ctx.header(header).unwrap_or("").to_string());
     }
 
-    // Canonicalized headers (x-ms-* headers)
-    parts.push(build_canonicalized_headers(ctx));
+    // Build the string-to-sign following Azure's exact format:
+    // [headers].join("\n") + "\n" + canonicalizedHeaders + canonicalizedResource
+    // Note: canonicalizedHeaders already has trailing \n for each header
+    let headers_str = parts.join("\n");
+    let canonicalized_headers = build_canonicalized_headers_with_trailing_newline(ctx);
+    let canonicalized_resource = build_canonicalized_resource(ctx);
 
-    // Canonicalized resource
-    parts.push(build_canonicalized_resource(ctx));
-
-    Ok(parts.join("\n"))
+    Ok(format!("{}\n{}{}", headers_str, canonicalized_headers, canonicalized_resource))
 }
 
 /// Builds the string-to-sign for SharedKeyLite authentication.
@@ -144,57 +148,55 @@ fn build_string_to_sign_lite(ctx: &RequestContext) -> StorageResult<String> {
         .unwrap_or("");
     parts.push(date.to_string());
 
-    // Canonicalized headers
-    parts.push(build_canonicalized_headers(ctx));
+    // Build the string-to-sign following Azure's format
+    let headers_str = parts.join("\n");
+    let canonicalized_headers = build_canonicalized_headers_with_trailing_newline(ctx);
+    let canonicalized_resource = build_canonicalized_resource_lite(ctx);
 
-    // Canonicalized resource (simplified)
-    parts.push(build_canonicalized_resource_lite(ctx));
-
-    Ok(parts.join("\n"))
+    Ok(format!("{}\n{}{}", headers_str, canonicalized_headers, canonicalized_resource))
 }
 
-/// Builds canonicalized headers string.
-fn build_canonicalized_headers(ctx: &RequestContext) -> String {
+/// Builds canonicalized headers string with trailing newline after each header.
+/// This matches Azure's format where each header line ends with \n.
+fn build_canonicalized_headers_with_trailing_newline(ctx: &RequestContext) -> String {
     let ms_headers = ctx.ms_headers();
     if ms_headers.is_empty() {
         return String::new();
     }
 
-    ms_headers
-        .iter()
-        .map(|(name, value)| {
-            // Normalize header name to lowercase and trim whitespace from value
-            let normalized_value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!("{}:{}", name.to_lowercase(), normalized_value)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut result = String::new();
+    for (name, value) in ms_headers.iter() {
+        // Normalize header name to lowercase and trim whitespace from value
+        let normalized_value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        result.push_str(&name.to_lowercase());
+        result.push(':');
+        result.push_str(&normalized_value);
+        result.push('\n');
+    }
+    result
 }
 
 /// Builds canonicalized resource string for SharedKey.
 fn build_canonicalized_resource(ctx: &RequestContext) -> String {
-    let mut resource = format!("/{}", ctx.account);
+    // The canonicalized resource is /{account}{path}
+    // where path already includes the account (e.g., /devstoreaccount1/container)
+    // So the result is /devstoreaccount1/devstoreaccount1/container
+    let mut resource = format!("/{}{}", ctx.account, ctx.uri.path());
 
-    // Add path
-    let path = ctx.uri.path();
-    // Remove account from path if present
-    let path = if let Some(stripped) = path.strip_prefix(&format!("/{}", ctx.account)) {
-        stripped
-    } else {
-        path
-    };
-    resource.push_str(path);
-
-    // Add query parameters (sorted alphabetically)
+    // Add query parameters (sorted alphabetically by lowercase key)
     if !ctx.query_params.is_empty() {
         let mut sorted_params: Vec<_> = ctx.query_params.iter().collect();
-        sorted_params.sort_by(|a, b| a.0.cmp(b.0));
+        sorted_params.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
         for (key, value) in sorted_params {
             resource.push('\n');
             resource.push_str(&key.to_lowercase());
             resource.push(':');
-            resource.push_str(value);
+            // URL-decode the value (Azure SDK sends encoded values)
+            let decoded = percent_encoding::percent_decode_str(value)
+                .decode_utf8_lossy()
+                .to_string();
+            resource.push_str(&decoded);
         }
     }
 
@@ -203,21 +205,17 @@ fn build_canonicalized_resource(ctx: &RequestContext) -> String {
 
 /// Builds canonicalized resource string for SharedKeyLite.
 fn build_canonicalized_resource_lite(ctx: &RequestContext) -> String {
-    let mut resource = format!("/{}", ctx.account);
-
-    // Add path
-    let path = ctx.uri.path();
-    let path = if let Some(stripped) = path.strip_prefix(&format!("/{}", ctx.account)) {
-        stripped
-    } else {
-        path
-    };
-    resource.push_str(path);
+    // The canonicalized resource is /{account}{path}
+    let mut resource = format!("/{}{}", ctx.account, ctx.uri.path());
 
     // Only add comp parameter for Lite
     if let Some(comp) = ctx.query_param("comp") {
         resource.push_str("?comp=");
-        resource.push_str(comp);
+        // URL-decode the value
+        let decoded = percent_encoding::percent_decode_str(comp)
+            .decode_utf8_lossy()
+            .to_string();
+        resource.push_str(&decoded);
     }
 
     resource
