@@ -142,6 +142,10 @@ pub async fn download_blob(
         HeaderValue::from_str(&blob.properties.server_encrypted.to_string()).unwrap(),
     );
     headers.insert(
+        "x-ms-creation-time",
+        HeaderValue::from_str(&format_http_date(&blob.properties.created_on)).unwrap(),
+    );
+    headers.insert(
         "Accept-Ranges",
         HeaderValue::from_static("bytes"),
     );
@@ -316,7 +320,11 @@ pub async fn delete_blob(
         let _ = extents.delete(&chunk.id).await;
     }
 
-    let headers = common_headers();
+    let mut headers = common_headers();
+    headers.insert(
+        "x-ms-delete-type-permanent",
+        HeaderValue::from_static("true"),
+    );
 
     Ok(build_response(StatusCode::ACCEPTED, headers, Body::empty()))
 }

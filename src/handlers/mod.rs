@@ -29,6 +29,7 @@ pub fn common_headers() -> HeaderMap {
     headers.insert("x-ms-request-id", HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap());
     headers.insert("x-ms-version", HeaderValue::from_static("2021-10-04"));
     headers.insert("Date", HeaderValue::from_str(&format_http_date(&Utc::now())).unwrap());
+    headers.insert("server", HeaderValue::from_static("Azurite-Blob/3.31.0"));
     headers
 }
 
