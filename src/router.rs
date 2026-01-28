@@ -97,6 +97,15 @@ async fn container_handler(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response<Body> {
+    // Debug logging for incoming container requests
+    tracing::debug!(
+        "CONTAINER REQUEST: method={} uri={} path_params={:?}",
+        method,
+        uri,
+        params
+    );
+    tracing::debug!("CONTAINER REQUEST: query_params={:?}", query);
+
     let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
         Ok(ctx) => ctx,
         Err(e) => return error_response_for_method(e, &method, ""),
@@ -104,6 +113,7 @@ async fn container_handler(
 
     // Authenticate
     if let Err(e) = authenticate(&ctx, &state.config) {
+        tracing::debug!("CONTAINER REQUEST: Authentication failed - {:?}", e);
         return error_response_for_method(e, &method, &ctx.request_id);
     }
 
@@ -124,13 +134,30 @@ async fn blob_handler(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response<Body> {
+    // Debug logging for incoming blob requests
+    tracing::debug!(
+        "BLOB REQUEST: method={} uri={} path_params={:?}",
+        method,
+        uri,
+        params
+    );
+    tracing::debug!("BLOB REQUEST: query_params={:?}", query);
+
     let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
         Ok(ctx) => ctx,
         Err(e) => return error_response_for_method(e, &method, ""),
     };
 
+    tracing::debug!(
+        "BLOB REQUEST CTX: account={} container={:?} blob={:?}",
+        ctx.account,
+        ctx.container,
+        ctx.blob
+    );
+
     // Authenticate
     if let Err(e) = authenticate(&ctx, &state.config) {
+        tracing::debug!("BLOB REQUEST: Authentication failed - {:?}", e);
         return error_response_for_method(e, &method, &ctx.request_id);
     }
 

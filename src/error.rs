@@ -460,12 +460,25 @@ impl StorageError {
 impl IntoResponse for StorageError {
     fn into_response(self) -> Response {
         let status = self.code.status_code();
-        let body = self.to_xml();
         let request_id = self.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.7fZ").to_string();
 
-        let mut response = Response::builder()
+        // Build message with RequestId and Time like Azure does
+        let full_message = format!(
+            "{}\nRequestId:{}\nTime:{}",
+            self.message, request_id, timestamp
+        );
+
+        // Match Azure's exact format with proper newlines
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Error>\n<Code>{}</Code>\n<Message>{}</Message>\n</Error>",
+            self.code.as_str(),
+            xml_escape(&full_message)
+        );
+
+        let response = Response::builder()
             .status(status)
-            .header("Content-Type", "application/xml")
+            .header("Content-Type", "application/xml; charset=utf-8")
             .header("x-ms-request-id", &request_id)
             .header("x-ms-version", "2021-10-04")
             .header("x-ms-error-code", self.code.as_str())

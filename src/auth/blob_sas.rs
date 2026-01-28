@@ -160,8 +160,17 @@ impl BlobSasParameters {
             .decode_utf8()
             .map_err(|_| StorageError::new(ErrorCode::AuthenticationFailed))?;
 
+        tracing::debug!(
+            "BLOB SAS VALIDATION:\n  StringToSign (escaped): {:?}\n  StringToSign (raw):\n{}\n  Expected sig: {}\n  Provided sig: {}\n  Raw sig param: {}",
+            string_to_sign,
+            string_to_sign,
+            expected_signature,
+            provided_signature,
+            self.signature
+        );
+
         if provided_signature != expected_signature {
-            tracing::debug!(
+            tracing::warn!(
                 "Blob SAS signature mismatch:\n  Expected: {}\n  Provided: {}\n  StringToSign: {:?}",
                 expected_signature,
                 provided_signature,
@@ -170,6 +179,7 @@ impl BlobSasParameters {
             return Err(StorageError::new(ErrorCode::AuthenticationFailed));
         }
 
+        tracing::debug!("BLOB SAS: Signature validated successfully");
         Ok(())
     }
 

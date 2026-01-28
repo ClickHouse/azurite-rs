@@ -21,8 +21,19 @@ pub struct AuthResult {
 
 /// Authenticates a request using available authentication methods.
 pub fn authenticate(ctx: &RequestContext, config: &Config) -> StorageResult<AuthResult> {
+    // Log all incoming requests for debugging
+    tracing::debug!(
+        "AUTH REQUEST: method={} account={} container={:?} blob={:?}",
+        ctx.method,
+        ctx.account,
+        ctx.container,
+        ctx.blob
+    );
+    tracing::debug!("AUTH QUERY PARAMS: {:?}", ctx.query_params);
+
     // Check for Authorization header (SharedKey)
     if ctx.header("authorization").is_some() {
+        tracing::debug!("AUTH: Using SharedKey authentication");
         validate_shared_key(ctx, config)?;
         return Ok(AuthResult {
             account: ctx.account.clone(),
@@ -32,6 +43,7 @@ pub fn authenticate(ctx: &RequestContext, config: &Config) -> StorageResult<Auth
 
     // Check for Account SAS token
     if let Some(account_sas) = AccountSasParameters::from_query(&ctx.query_params) {
+        tracing::debug!("AUTH: Found Account SAS token");
         let resource_type = get_resource_type(ctx);
         let required_permission = get_required_permission(ctx);
         account_sas.validate(ctx, config, resource_type, required_permission)?;
@@ -43,13 +55,23 @@ pub fn authenticate(ctx: &RequestContext, config: &Config) -> StorageResult<Auth
 
     // Check for Blob SAS token
     if let Some(blob_sas) = BlobSasParameters::from_query(&ctx.query_params) {
+        tracing::debug!(
+            "AUTH: Found Blob SAS token - sr={} sp={} se={} sig={}",
+            blob_sas.signed_resource,
+            blob_sas.signed_permissions,
+            blob_sas.signed_expiry,
+            &blob_sas.signature[..20.min(blob_sas.signature.len())]
+        );
         let required_permission = get_blob_required_permission(ctx);
+        tracing::debug!("AUTH: Required permission: {}", required_permission);
         blob_sas.validate(ctx, config, required_permission)?;
         return Ok(AuthResult {
             account: ctx.account.clone(),
             is_anonymous: false,
         });
     }
+
+    tracing::debug!("AUTH: No SAS token found in query params, checking anonymous access");
 
     // Check if account exists (for anonymous access)
     if config.get_account_key(&ctx.account).is_some() {
