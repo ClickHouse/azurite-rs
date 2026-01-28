@@ -323,6 +323,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "http 1.4.0",
+ "hyper 1.8.1",
  "md-5",
  "mime",
  "parking_lot",

@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use hyper::ext::ReasonPhrase;
 use thiserror::Error;
 
 /// Azure Storage error codes.
@@ -461,29 +462,38 @@ impl IntoResponse for StorageError {
     fn into_response(self) -> Response {
         let status = self.code.status_code();
         let request_id = self.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.7fZ").to_string();
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
 
-        // Build message with RequestId and Time like Azure does
-        let full_message = format!(
-            "{}\nRequestId:{}\nTime:{}",
-            self.message, request_id, timestamp
-        );
-
-        // Match Azure's exact format with proper newlines
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Error>\n<Code>{}</Code>\n<Message>{}</Message>\n</Error>",
+        // Match original Azurite's XML format with pretty-printing and included RequestId/Time
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Error>
+  <Code>{}</Code>
+  <Message>{}
+RequestId:{}
+Time:{}</Message>
+</Error>"#,
             self.code.as_str(),
-            xml_escape(&full_message)
+            xml_escape(&self.message),
+            request_id,
+            timestamp
         );
 
-        let response = Response::builder()
+        // Build the response
+        let mut response = Response::builder()
             .status(status)
-            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Content-Type", "application/xml")
             .header("x-ms-request-id", &request_id)
             .header("x-ms-version", "2021-10-04")
             .header("x-ms-error-code", self.code.as_str())
-            .body(body.into())
+            .body(xml.into())
             .unwrap();
+
+        // Set custom reason phrase to match original Azurite behavior (for HTTP/1.1)
+        // This puts the error message in the HTTP status line so clients can see it
+        if let Ok(reason) = ReasonPhrase::try_from(self.message.as_bytes()) {
+            response.extensions_mut().insert(reason);
+        }
 
         response
     }
