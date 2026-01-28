@@ -220,9 +220,13 @@ impl BlobSasParameters {
             resource.push_str(container);
         }
 
-        if let Some(ref blob) = ctx.blob {
-            resource.push('/');
-            resource.push_str(blob);
+        // Only include blob in canonicalized resource for blob SAS (sr=b, bs, bv),
+        // not for container SAS (sr=c)
+        if self.signed_resource != "c" {
+            if let Some(ref blob) = ctx.blob {
+                resource.push('/');
+                resource.push_str(blob);
+            }
         }
 
         resource
