@@ -450,11 +450,7 @@ impl StorageError {
     /// Converts the error to an XML error response body.
     pub fn to_xml(&self) -> String {
         format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<Error>
-  <Code>{}</Code>
-  <Message>{}</Message>
-</Error>"#,
+            r#"<?xml version="1.0" encoding="utf-8"?><Error><Code>{}</Code><Message>{}</Message></Error>"#,
             self.code.as_str(),
             xml_escape(&self.message)
         )

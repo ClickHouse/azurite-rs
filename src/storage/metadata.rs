@@ -306,6 +306,11 @@ impl MetadataStore for MemoryMetadataStore {
         name: &str,
         snapshot: &str,
     ) -> StorageResult<BlobModel> {
+        // First check if container exists
+        if !self.container_exists(account, container).await {
+            return Err(StorageError::new(ErrorCode::ContainerNotFound));
+        }
+
         let key = Self::blob_key(account, container, name, snapshot);
         self.blobs
             .get(&key)
@@ -327,6 +332,11 @@ impl MetadataStore for MemoryMetadataStore {
         name: &str,
         snapshot: &str,
     ) -> StorageResult<()> {
+        // First check if container exists
+        if !self.container_exists(account, container).await {
+            return Err(StorageError::new(ErrorCode::ContainerNotFound));
+        }
+
         let key = Self::blob_key(account, container, name, snapshot);
 
         // Remove from main store
