@@ -29,6 +29,9 @@ fn error_response_for_method(error: StorageError, method: &Method, request_id: &
         let (mut parts, _) = response.into_parts();
         // Remove content-length header since there's no body
         parts.headers.remove(header::CONTENT_LENGTH);
+        // Remove content-type header to prevent Azure SDK from trying to parse empty XML body
+        // Azure SDK tries to parse XML if Content-Type contains "xml", which fails on empty body
+        parts.headers.remove(header::CONTENT_TYPE);
         Response::from_parts(parts, Body::empty())
     } else {
         response
