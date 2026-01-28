@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::error::{ErrorCode, StorageError, StorageResult};
@@ -37,10 +37,14 @@ pub trait ExtentStore: Send + Sync {
     async fn total_size(&self) -> u64;
 }
 
-/// In-memory implementation of the extent store.
+/// Number of shards for the extent store (must be power of 2).
+const NUM_SHARDS: usize = 64;
+
+/// Sharded in-memory implementation of the extent store.
+/// Uses multiple DashMaps to reduce lock contention.
 pub struct MemoryExtentStore {
-    /// Extents indexed by ID.
-    extents: DashMap<String, Bytes>,
+    /// Sharded extents - each shard handles a subset of extent IDs.
+    shards: Vec<DashMap<Arc<str>, Bytes>>,
     /// Current total size in bytes.
     current_size: AtomicU64,
     /// Maximum size limit (0 = unlimited).
@@ -49,19 +53,32 @@ pub struct MemoryExtentStore {
 
 impl MemoryExtentStore {
     pub fn new() -> Self {
+        let shards = (0..NUM_SHARDS).map(|_| DashMap::new()).collect();
         Self {
-            extents: DashMap::new(),
+            shards,
             current_size: AtomicU64::new(0),
             size_limit: 0,
         }
     }
 
     pub fn with_limit(limit: u64) -> Self {
+        let shards = (0..NUM_SHARDS).map(|_| DashMap::new()).collect();
         Self {
-            extents: DashMap::new(),
+            shards,
             current_size: AtomicU64::new(0),
             size_limit: limit,
         }
+    }
+
+    /// Get the shard for a given extent ID.
+    #[inline]
+    fn get_shard(&self, extent_id: &str) -> &DashMap<Arc<str>, Bytes> {
+        // Use a simple hash of the first few bytes of the UUID
+        let hash = extent_id
+            .bytes()
+            .take(8)
+            .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+        &self.shards[hash % NUM_SHARDS]
     }
 }
 
@@ -88,16 +105,19 @@ impl ExtentStore for MemoryExtentStore {
         }
 
         let extent_id = Uuid::new_v4().to_string();
-        self.extents.insert(extent_id.clone(), data);
+        let extent_id_arc: Arc<str> = Arc::from(extent_id.as_str());
+
+        let shard = self.get_shard(&extent_id);
+        shard.insert(extent_id_arc, data);
         self.current_size.fetch_add(size, Ordering::Relaxed);
 
         Ok(ExtentChunk::new(extent_id, 0, size))
     }
 
     async fn read(&self, chunk: &ExtentChunk) -> StorageResult<Bytes> {
-        let extent = self
-            .extents
-            .get(&chunk.id)
+        let shard = self.get_shard(&chunk.id);
+        let extent = shard
+            .get(chunk.id.as_str())
             .ok_or_else(|| StorageError::new(ErrorCode::InternalError))?;
 
         let start = chunk.offset as usize;
@@ -116,9 +136,9 @@ impl ExtentStore for MemoryExtentStore {
         offset: u64,
         count: u64,
     ) -> StorageResult<Bytes> {
-        let extent = self
-            .extents
-            .get(&chunk.id)
+        let shard = self.get_shard(&chunk.id);
+        let extent = shard
+            .get(chunk.id.as_str())
             .ok_or_else(|| StorageError::new(ErrorCode::InternalError))?;
 
         let start = (chunk.offset + offset) as usize;
@@ -132,7 +152,8 @@ impl ExtentStore for MemoryExtentStore {
     }
 
     async fn delete(&self, extent_id: &str) -> StorageResult<()> {
-        if let Some((_, data)) = self.extents.remove(extent_id) {
+        let shard = self.get_shard(extent_id);
+        if let Some((_, data)) = shard.remove(extent_id) {
             self.current_size
                 .fetch_sub(data.len() as u64, Ordering::Relaxed);
         }
@@ -149,7 +170,7 @@ pub struct FsExtentStore {
     /// Base directory for extent files.
     base_path: PathBuf,
     /// Metadata for extents (size tracking).
-    extent_sizes: DashMap<String, u64>,
+    extent_sizes: DashMap<Arc<str>, u64>,
     /// Current total size in bytes.
     current_size: AtomicU64,
 }
@@ -157,7 +178,10 @@ pub struct FsExtentStore {
 impl FsExtentStore {
     pub async fn new(base_path: PathBuf) -> StorageResult<Self> {
         fs::create_dir_all(&base_path).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to create extent directory: {}", e))
+            StorageError::with_message(
+                ErrorCode::InternalError,
+                format!("Failed to create extent directory: {}", e),
+            )
         })?;
 
         Ok(Self {
@@ -180,14 +204,21 @@ impl ExtentStore for FsExtentStore {
         let path = self.extent_path(&extent_id);
 
         let mut file = fs::File::create(&path).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to create extent file: {}", e))
+            StorageError::with_message(
+                ErrorCode::InternalError,
+                format!("Failed to create extent file: {}", e),
+            )
         })?;
 
         file.write_all(&data).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to write extent data: {}", e))
+            StorageError::with_message(
+                ErrorCode::InternalError,
+                format!("Failed to write extent data: {}", e),
+            )
         })?;
 
-        self.extent_sizes.insert(extent_id.clone(), size);
+        let extent_id_arc: Arc<str> = Arc::from(extent_id.as_str());
+        self.extent_sizes.insert(extent_id_arc, size);
         self.current_size.fetch_add(size, Ordering::Relaxed);
 
         Ok(ExtentChunk::new(extent_id, 0, size))
@@ -206,17 +237,28 @@ impl ExtentStore for FsExtentStore {
         let path = self.extent_path(&chunk.id);
 
         let mut file = fs::File::open(&path).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to open extent file: {}", e))
+            StorageError::with_message(
+                ErrorCode::InternalError,
+                format!("Failed to open extent file: {}", e),
+            )
         })?;
 
         let start = chunk.offset + offset;
-        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to seek in extent file: {}", e))
-        })?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| {
+                StorageError::with_message(
+                    ErrorCode::InternalError,
+                    format!("Failed to seek in extent file: {}", e),
+                )
+            })?;
 
         let mut buffer = vec![0u8; count as usize];
         file.read_exact(&mut buffer).await.map_err(|e| {
-            StorageError::with_message(ErrorCode::InternalError, format!("Failed to read extent data: {}", e))
+            StorageError::with_message(
+                ErrorCode::InternalError,
+                format!("Failed to read extent data: {}", e),
+            )
         })?;
 
         Ok(Bytes::from(buffer))
@@ -237,5 +279,3 @@ impl ExtentStore for FsExtentStore {
         self.current_size.load(Ordering::Relaxed)
     }
 }
-
-use tokio::io::AsyncSeekExt;
