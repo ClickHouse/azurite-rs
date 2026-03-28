@@ -265,6 +265,262 @@ async fn test_clickhouse_copy() {
     assert_eq!(size, content.len());
 }
 
+/// Test batch delete (used by ClickHouse's BlobKillerThread for cleanup).
+/// Verifies the multipart/mixed batch protocol matches Azure C++ SDK expectations.
+#[tokio::test]
+async fn test_clickhouse_batch_delete() {
+    let server = TestServer::start().await;
+    create_container(&server, "clickhouse-batch").await;
+
+    let client = reqwest::Client::new();
+
+    // Upload 5 blobs to delete in a batch
+    let blob_names: Vec<String> = (0..5)
+        .map(|i| format!("data/part_{}.bin", i))
+        .collect();
+
+    for name in &blob_names {
+        let url = server.blob_url("clickhouse-batch", name);
+        client
+            .put(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .header("x-ms-blob-type", "BlockBlob")
+            .body("test content")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Build a batch delete request matching the Azure C++ SDK format.
+    // The SDK uses a flat multipart structure (no changeset nesting).
+    let batch_boundary = format!("batch_{}", uuid::Uuid::new_v4());
+    let mut batch_body = String::new();
+
+    for (i, name) in blob_names.iter().enumerate() {
+        batch_body.push_str(&format!("--{}\r\n", batch_boundary));
+        batch_body.push_str("Content-Type: application/http\r\n");
+        batch_body.push_str("Content-Transfer-Encoding: binary\r\n");
+        batch_body.push_str(&format!("Content-ID: {}\r\n", i));
+        batch_body.push_str("\r\n");
+        batch_body.push_str(&format!(
+            "DELETE /{}/clickhouse-batch/{} HTTP/1.1\r\n",
+            server.account, name
+        ));
+        batch_body.push_str("x-ms-version: 2021-10-04\r\n");
+        batch_body.push_str(&format!(
+            "x-ms-date: {}\r\n",
+            chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT")
+        ));
+        batch_body.push_str("\r\n");
+    }
+    batch_body.push_str(&format!("--{}--\r\n", batch_boundary));
+
+    // Submit batch at service level
+    let batch_url = format!("{}/{}?comp=batch", server.base_url, server.account);
+    let response = client
+        .post(&batch_url)
+        .header("x-ms-version", "2021-10-04")
+        .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header(
+            "Content-Type",
+            format!("multipart/mixed; boundary={}", batch_boundary),
+        )
+        .body(batch_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 202, "Batch request should return 202 Accepted");
+
+    let resp_content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        resp_content_type.starts_with("multipart/mixed; boundary="),
+        "Response Content-Type must be multipart/mixed"
+    );
+
+    let resp_body = response.text().await.unwrap();
+
+    // Verify the response body follows the flat multipart format expected by the Azure C++ SDK:
+    // 1. Body starts with --boundary (the SDK's Parser::Consume expects this)
+    let resp_boundary = resp_content_type
+        .strip_prefix("multipart/mixed; boundary=")
+        .unwrap();
+    assert!(
+        resp_body.starts_with(&format!("--{}", resp_boundary)),
+        "Response body must start with --boundary. Got: {:?}",
+        &resp_body[..resp_body.len().min(100)]
+    );
+
+    // 2. Each sub-response must have Content-ID matching the request
+    for i in 0..5 {
+        assert!(
+            resp_body.contains(&format!("Content-ID: {}", i)),
+            "Response must contain Content-ID: {}",
+            i
+        );
+    }
+
+    // 3. Each sub-response must have HTTP/1.1 202 status
+    let accepted_count = resp_body.matches("HTTP/1.1 202").count();
+    assert_eq!(
+        accepted_count, 5,
+        "All 5 sub-requests should return 202 Accepted, got {}",
+        accepted_count
+    );
+
+    // 4. Body must end with --boundary--
+    assert!(
+        resp_body.contains(&format!("--{}--", resp_boundary)),
+        "Response body must contain end boundary marker"
+    );
+
+    // Verify blobs are actually deleted
+    for name in &blob_names {
+        let url = server.blob_url("clickhouse-batch", name);
+        let response = client
+            .head(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "Blob {} should be deleted",
+            name
+        );
+    }
+}
+
+/// Test batch delete at container level (the other endpoint ClickHouse can use).
+#[tokio::test]
+async fn test_clickhouse_batch_delete_container_level() {
+    let server = TestServer::start().await;
+    create_container(&server, "clickhouse-batch2").await;
+
+    let client = reqwest::Client::new();
+
+    // Upload 3 blobs
+    for i in 0..3 {
+        let url = server.blob_url("clickhouse-batch2", &format!("blob_{}", i));
+        client
+            .put(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .header("x-ms-blob-type", "BlockBlob")
+            .body("data")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Build batch delete at container level
+    let batch_boundary = format!("batch_{}", uuid::Uuid::new_v4());
+    let mut batch_body = String::new();
+
+    for i in 0..3 {
+        batch_body.push_str(&format!("--{}\r\n", batch_boundary));
+        batch_body.push_str("Content-Type: application/http\r\n");
+        batch_body.push_str("Content-Transfer-Encoding: binary\r\n");
+        batch_body.push_str(&format!("Content-ID: {}\r\n", i));
+        batch_body.push_str("\r\n");
+        batch_body.push_str(&format!(
+            "DELETE /{}/clickhouse-batch2/blob_{} HTTP/1.1\r\n",
+            server.account, i
+        ));
+        batch_body.push_str("x-ms-version: 2021-10-04\r\n");
+        batch_body.push_str("\r\n");
+    }
+    batch_body.push_str(&format!("--{}--\r\n", batch_boundary));
+
+    // Submit batch at container level
+    let batch_url = format!(
+        "{}/{}?restype=container&comp=batch",
+        server.container_url("clickhouse-batch2"), ""
+    ).replace("/?", "?");
+    let response = client
+        .post(&batch_url)
+        .header("x-ms-version", "2021-10-04")
+        .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header(
+            "Content-Type",
+            format!("multipart/mixed; boundary={}", batch_boundary),
+        )
+        .body(batch_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 202);
+
+    let resp_body = response.text().await.unwrap();
+    let accepted_count = resp_body.matches("HTTP/1.1 202").count();
+    assert_eq!(accepted_count, 3, "All 3 sub-requests should return 202");
+}
+
+/// Test batch delete with non-existent blobs (should return 404 per sub-request).
+#[tokio::test]
+async fn test_clickhouse_batch_delete_not_found() {
+    let server = TestServer::start().await;
+    create_container(&server, "clickhouse-batch3").await;
+
+    let client = reqwest::Client::new();
+
+    let batch_boundary = format!("batch_{}", uuid::Uuid::new_v4());
+    let mut batch_body = String::new();
+
+    // Request to delete non-existent blobs
+    for i in 0..2 {
+        batch_body.push_str(&format!("--{}\r\n", batch_boundary));
+        batch_body.push_str("Content-Type: application/http\r\n");
+        batch_body.push_str("Content-Transfer-Encoding: binary\r\n");
+        batch_body.push_str(&format!("Content-ID: {}\r\n", i));
+        batch_body.push_str("\r\n");
+        batch_body.push_str(&format!(
+            "DELETE /{}/clickhouse-batch3/nonexistent_{} HTTP/1.1\r\n",
+            server.account, i
+        ));
+        batch_body.push_str("x-ms-version: 2021-10-04\r\n");
+        batch_body.push_str("\r\n");
+    }
+    batch_body.push_str(&format!("--{}--\r\n", batch_boundary));
+
+    let batch_url = format!("{}/{}?comp=batch", server.base_url, server.account);
+    let response = client
+        .post(&batch_url)
+        .header("x-ms-version", "2021-10-04")
+        .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header(
+            "Content-Type",
+            format!("multipart/mixed; boundary={}", batch_boundary),
+        )
+        .body(batch_body)
+        .send()
+        .await
+        .unwrap();
+
+    // Batch itself returns 202 even if sub-requests fail
+    assert_eq!(response.status(), 202);
+
+    let resp_body = response.text().await.unwrap();
+
+    // Sub-responses should be 404
+    let not_found_count = resp_body.matches("HTTP/1.1 404").count();
+    assert_eq!(not_found_count, 2, "Both sub-requests should return 404");
+
+    // Content-IDs must still be present
+    assert!(resp_body.contains("Content-ID: 0"));
+    assert!(resp_body.contains("Content-ID: 1"));
+}
+
 /// Test hierarchical listing with delimiter (used by ClickHouse for virtual directories).
 #[tokio::test]
 async fn test_clickhouse_hierarchical_list() {
