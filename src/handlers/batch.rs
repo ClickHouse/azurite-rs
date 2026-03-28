@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderValue, Response, StatusCode},
 };
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use std::sync::Arc;
 
 use crate::context::RequestContext;
@@ -252,7 +253,9 @@ async fn execute_sub_request(
     method: &str,
     path: &str,
 ) -> (u16, &'static str, Vec<(&'static str, String)>, String) {
-    let path_clean = path.split('?').next().unwrap_or(path);
+    // URL-decode the path since Azure SDK URL-encodes blob paths in batch sub-requests
+    let decoded_path = percent_decode_str(path).decode_utf8_lossy();
+    let path_clean = decoded_path.split('?').next().unwrap_or(&decoded_path);
     let segments: Vec<&str> = path_clean
         .trim_start_matches('/')
         .splitn(3, '/')

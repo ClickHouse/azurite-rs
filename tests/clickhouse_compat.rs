@@ -521,6 +521,93 @@ async fn test_clickhouse_batch_delete_not_found() {
     assert!(resp_body.contains("Content-ID: 1"));
 }
 
+/// Test batch delete with URL-encoded paths (Azure C++ SDK encodes slashes as %2F).
+#[tokio::test]
+async fn test_clickhouse_batch_delete_url_encoded() {
+    let server = TestServer::start().await;
+    create_container(&server, "clickhouse-batch-enc").await;
+
+    let client = reqwest::Client::new();
+
+    // Upload blobs with slashes in paths (like ClickHouse partition structure)
+    let blob_names = vec![
+        "data/all_1_1_0/data.bin",
+        "data/all_1_1_0/data.mrk",
+        "data/all_2_2_0/columns.txt",
+    ];
+
+    for name in &blob_names {
+        let url = server.blob_url("clickhouse-batch-enc", name);
+        client
+            .put(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .header("x-ms-blob-type", "BlockBlob")
+            .body("test content")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Build batch delete with URL-encoded paths (as the Azure C++ SDK sends them)
+    let batch_boundary = format!("batch_{}", uuid::Uuid::new_v4());
+    let mut batch_body = String::new();
+
+    for (i, name) in blob_names.iter().enumerate() {
+        // URL-encode the path: slashes become %2F
+        let encoded_name = name.replace("/", "%2F");
+        batch_body.push_str(&format!("--{}\r\n", batch_boundary));
+        batch_body.push_str("Content-Type: application/http\r\n");
+        batch_body.push_str("Content-Transfer-Encoding: binary\r\n");
+        batch_body.push_str(&format!("Content-ID: {}\r\n", i));
+        batch_body.push_str("\r\n");
+        batch_body.push_str(&format!(
+            "DELETE /{}/clickhouse-batch-enc/{} HTTP/1.1\r\n",
+            server.account, encoded_name
+        ));
+        batch_body.push_str("x-ms-version: 2021-10-04\r\n");
+        batch_body.push_str("\r\n");
+    }
+    batch_body.push_str(&format!("--{}--\r\n", batch_boundary));
+
+    let batch_url = format!("{}/{}?comp=batch", server.base_url, server.account);
+    let response = client
+        .post(&batch_url)
+        .header("x-ms-version", "2021-10-04")
+        .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header(
+            "Content-Type",
+            format!("multipart/mixed; boundary={}", batch_boundary),
+        )
+        .body(batch_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 202);
+
+    let resp_body = response.text().await.unwrap();
+    let accepted_count = resp_body.matches("HTTP/1.1 202").count();
+    assert_eq!(
+        accepted_count, 3,
+        "All 3 URL-encoded batch deletes should return 202, got {}. Response:\n{}",
+        accepted_count, resp_body
+    );
+
+    // Verify blobs are actually deleted
+    for name in &blob_names {
+        let url = server.blob_url("clickhouse-batch-enc", name);
+        let response = client
+            .head(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "Blob {} should be deleted", name);
+    }
+}
+
 /// Test hierarchical listing with delimiter (used by ClickHouse for virtual directories).
 #[tokio::test]
 async fn test_clickhouse_hierarchical_list() {
