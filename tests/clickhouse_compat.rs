@@ -521,6 +521,215 @@ async fn test_clickhouse_batch_delete_not_found() {
     assert!(resp_body.contains("Content-ID: 1"));
 }
 
+/// Test that the batch response can be parsed exactly like the Azure C++ SDK does.
+/// This simulates blob_batch.cpp's ParseSubresponses algorithm.
+#[tokio::test]
+async fn test_batch_response_parseable_by_cpp_sdk() {
+    let server = TestServer::start().await;
+    create_container(&server, "batch-parse-test").await;
+
+    let client = reqwest::Client::new();
+
+    // Upload blobs with hierarchical paths like ClickHouse uses
+    let blob_names = vec![
+        "plain-tables/store/abc/data/all_1_1_0/columns.txt",
+        "plain-tables/store/abc/data/all_1_1_0/data.bin",
+        "plain-tables/store/abc/data/all_1_1_0/data.mrk",
+    ];
+
+    for name in &blob_names {
+        let url = server.blob_url("batch-parse-test", name);
+        client
+            .put(&url)
+            .header("x-ms-version", "2021-10-04")
+            .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .header("x-ms-blob-type", "BlockBlob")
+            .body("content")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Build batch exactly like the Azure C++ SDK does (NoopTransportPolicy::Send)
+    let batch_boundary = format!("batch_{}", uuid::Uuid::new_v4());
+    let mut batch_body = String::new();
+
+    for (i, name) in blob_names.iter().enumerate() {
+        batch_body.push_str(&format!("--{}\r\n", batch_boundary));
+        batch_body.push_str("Content-Type: application/http\r\n");
+        batch_body.push_str("Content-Transfer-Encoding: binary\r\n");
+        batch_body.push_str(&format!("Content-ID: {}\r\n", i));
+        batch_body.push_str("\r\n");
+        // SDK uses: METHOD /<relative-url> HTTP/1.1
+        batch_body.push_str(&format!(
+            "DELETE /{}/batch-parse-test/{} HTTP/1.1\r\n",
+            server.account, name
+        ));
+        batch_body.push_str(&format!(
+            "x-ms-date: {}\r\n",
+            chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT")
+        ));
+        batch_body.push_str("x-ms-version: 2021-10-04\r\n");
+        batch_body.push_str("Content-Length: 0\r\n");
+        batch_body.push_str("\r\n");
+    }
+    batch_body.push_str(&format!("--{}--\r\n", batch_boundary));
+
+    // Submit batch at container level (like BlobContainerClient::SubmitBatch)
+    let batch_url = format!(
+        "{}?restype=container&comp=batch",
+        server.container_url("batch-parse-test")
+    );
+    let response = client
+        .post(&batch_url)
+        .header("x-ms-version", "2021-10-04")
+        .header("x-ms-date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header(
+            "Content-Type",
+            format!("multipart/mixed; boundary={}", batch_boundary),
+        )
+        .body(batch_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 202);
+
+    let resp_content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let resp_body = response.text().await.unwrap();
+
+    // --- Simulate the Azure C++ SDK's ParseSubresponses algorithm (blob_batch.cpp) ---
+    // This must EXACTLY match the C++ SDK's parsing logic to catch compatibility bugs.
+    // See: azure-sdk-for-cpp/sdk/storage/azure-storage-blobs/src/blob_batch.cpp
+
+    let boundary = resp_content_type
+        .strip_prefix("multipart/mixed; boundary=")
+        .expect("Content-Type must have boundary");
+
+    let boundary_marker = format!("--{}", boundary);
+
+    // The C++ SDK parser works on raw bytes with pointer arithmetic.
+    // We simulate it faithfully here using byte positions.
+    let body = resp_body.as_bytes();
+    let mut pos: usize = 0;
+    let end = body.len();
+
+    let mut parsed_responses: Vec<(usize, String)> = Vec::new();
+
+    // Helper: check if body[pos..] starts with `pattern`
+    let starts_with = |p: usize, pattern: &[u8]| -> bool {
+        p + pattern.len() <= end && &body[p..p + pattern.len()] == pattern
+    };
+
+    // Helper: find `pattern` starting from position `from`, return position or end
+    let find_from = |from: usize, pattern: &[u8]| -> usize {
+        body[from..end]
+            .windows(pattern.len())
+            .position(|w| w == pattern)
+            .map(|i| from + i)
+            .unwrap_or(end)
+    };
+
+    loop {
+        // SDK: parser.Consume("--" + boundary)
+        assert!(
+            starts_with(pos, boundary_marker.as_bytes()),
+            "SDK parser: expected boundary at pos {}. Body around pos: {:?}",
+            pos,
+            std::str::from_utf8(&body[pos..end.min(pos + 80)]).unwrap_or("<invalid utf8>")
+        );
+        pos += boundary_marker.len();
+
+        // SDK: if (parser.LookAhead("--")) { parser.Consume("--"); }
+        if starts_with(pos, b"--") {
+            pos += 2;
+        }
+
+        // SDK: if (parser.IsEnd()) { break; }
+        if pos == end {
+            break;
+        }
+
+        // SDK: auto contentIdPos = parser.AfterNext("Content-ID: ");
+        let content_id_pattern = b"Content-ID: ";
+        let content_id_find = find_from(pos, content_id_pattern);
+        let content_id_pos = if content_id_find < end {
+            content_id_find + content_id_pattern.len()
+        } else {
+            end
+        };
+
+        // SDK: auto responseStartPos = parser.AfterNext(LineEnding + LineEnding);
+        let double_crlf = b"\r\n\r\n";
+        let response_start_find = find_from(pos, double_crlf);
+        let response_start_pos = if response_start_find < end {
+            response_start_find + double_crlf.len()
+        } else {
+            end
+        };
+
+        // SDK: auto responseEndPos = parser.FindNext("--" + boundary);
+        let response_end_pos = find_from(pos, boundary_marker.as_bytes());
+
+        // SDK: if (contentIdPos != parser.endPos)
+        if content_id_pos != end {
+            // Extract Content-ID value
+            let id_end = find_from(content_id_pos, b"\r\n");
+            let id_str = std::str::from_utf8(&body[content_id_pos..id_end]).unwrap();
+            let content_id: usize = id_str.parse().expect("Content-ID must be integer");
+
+            // Extract response text
+            let response_text = std::str::from_utf8(&body[response_start_pos..response_end_pos]).unwrap();
+
+            // Verify response starts with HTTP/
+            assert!(
+                response_text.starts_with("HTTP/"),
+                "SDK parser: sub-response {} must start with 'HTTP/'. Got: {:?}",
+                content_id,
+                &response_text[..response_text.len().min(80)]
+            );
+
+            parsed_responses.push((content_id, response_text.to_string()));
+
+            // SDK: parser.currPos = responseEndPos;
+            pos = response_end_pos;
+        } else {
+            // SDK else branch: ParseRawResponse on the extracted text (no Content-ID)
+            let response_text = std::str::from_utf8(&body[response_start_pos..response_end_pos]).unwrap();
+            panic!(
+                "SDK parser: sub-response without Content-ID found. Response text: {:?}",
+                &response_text[..response_text.len().min(80)]
+            );
+        }
+    }
+
+    // Verify we got responses for all sub-requests
+    assert_eq!(
+        parsed_responses.len(),
+        blob_names.len(),
+        "SDK parser: expected {} sub-responses, got {}",
+        blob_names.len(),
+        parsed_responses.len()
+    );
+
+    // Verify each response has correct Content-ID and status
+    for (content_id, response_text) in &parsed_responses {
+        assert!(
+            response_text.contains("HTTP/1.1 202 Accepted"),
+            "Sub-response {} should be 202 Accepted. Got: {:?}",
+            content_id,
+            &response_text[..response_text.len().min(80)]
+        );
+    }
+}
+
 /// Test batch delete with URL-encoded paths (Azure C++ SDK encodes slashes as %2F).
 #[tokio::test]
 async fn test_clickhouse_batch_delete_url_encoded() {

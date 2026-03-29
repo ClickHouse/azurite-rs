@@ -80,7 +80,7 @@ pub async fn submit_batch(
             response_body.push_str("\r\n");
         }
     }
-    response_body.push_str(&format!("--{}--\r\n", response_boundary));
+    response_body.push_str(&format!("--{}--", response_boundary));
 
     let mut headers = common_headers();
     headers.insert(
