@@ -60,6 +60,64 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Handles a request, logging method, path, status, and duration to stderr.
+async fn handle_request(
+    state: &AppState,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+    query: HashMap<String, String>,
+    body: Bytes,
+) -> Response<Body> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQ_ID: AtomicU64 = AtomicU64::new(0);
+    let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let path = uri.path().to_string();
+    eprintln!("[{}] > {} {}", req_id, method, path);
+
+    let ctx = match RequestContext::new(method.clone(), uri, headers, params, query) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            let resp = error_response_for_method(e, &method, "");
+            log_request(req_id, &method, &path, resp.status().as_u16(), t0);
+            return resp;
+        }
+    };
+
+    if let Err(e) = authenticate(&ctx, &state.config) {
+        let resp = error_response_for_method(e, &method, &ctx.request_id);
+        log_request(req_id, &method, &path, resp.status().as_u16(), t0);
+        return resp;
+    }
+
+    let result = if ctx.is_service_request() {
+        route_service_request(&ctx, state, body).await
+    } else if ctx.is_blob_request() {
+        route_blob_request(&ctx, state, body).await
+    } else {
+        route_container_request(&ctx, state, body).await
+    };
+
+    let resp = match result {
+        Ok(response) => response,
+        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
+    };
+    log_request(req_id, &method, &path, resp.status().as_u16(), t0);
+    resp
+}
+
+/// Log request completion to stderr (always visible, even in --silent mode).
+#[inline]
+fn log_request(req_id: u64, method: &Method, path: &str, status: u16, t0: std::time::Instant) {
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "[{}] < {} {} {} {:.1}ms",
+        req_id, method, path, status, elapsed.as_secs_f64() * 1000.0
+    );
+}
+
 /// Handler for service-level operations.
 async fn service_handler(
     State(state): State<AppState>,
@@ -70,21 +128,7 @@ async fn service_handler(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response<Body> {
-    let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response_for_method(e, &method, ""),
-    };
-
-    // Authenticate
-    if let Err(e) = authenticate(&ctx, &state.config) {
-        return error_response_for_method(e, &method, &ctx.request_id);
-    }
-
-    let result = route_service_request(&ctx, &state, body).await;
-    match result {
-        Ok(response) => response,
-        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
-    }
+    handle_request(&state, method, uri, headers, params, query, body).await
 }
 
 /// Handler for container-level operations.
@@ -97,31 +141,7 @@ async fn container_handler(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response<Body> {
-    // Debug logging for incoming container requests
-    tracing::debug!(
-        "CONTAINER REQUEST: method={} uri={} path_params={:?}",
-        method,
-        uri,
-        params
-    );
-    tracing::debug!("CONTAINER REQUEST: query_params={:?}", query);
-
-    let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response_for_method(e, &method, ""),
-    };
-
-    // Authenticate
-    if let Err(e) = authenticate(&ctx, &state.config) {
-        tracing::debug!("CONTAINER REQUEST: Authentication failed - {:?}", e);
-        return error_response_for_method(e, &method, &ctx.request_id);
-    }
-
-    let result = route_container_request(&ctx, &state, body).await;
-    match result {
-        Ok(response) => response,
-        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
-    }
+    handle_request(&state, method, uri, headers, params, query, body).await
 }
 
 /// Handler for blob-level operations.
@@ -134,38 +154,7 @@ async fn blob_handler(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response<Body> {
-    // Debug logging for incoming blob requests
-    tracing::debug!(
-        "BLOB REQUEST: method={} uri={} path_params={:?}",
-        method,
-        uri,
-        params
-    );
-    tracing::debug!("BLOB REQUEST: query_params={:?}", query);
-
-    let ctx = match RequestContext::new(method.clone(), uri, headers.clone(), params, query) {
-        Ok(ctx) => ctx,
-        Err(e) => return error_response_for_method(e, &method, ""),
-    };
-
-    tracing::debug!(
-        "BLOB REQUEST CTX: account={} container={:?} blob={:?}",
-        ctx.account,
-        ctx.container,
-        ctx.blob
-    );
-
-    // Authenticate
-    if let Err(e) = authenticate(&ctx, &state.config) {
-        tracing::debug!("BLOB REQUEST: Authentication failed - {:?}", e);
-        return error_response_for_method(e, &method, &ctx.request_id);
-    }
-
-    let result = route_blob_request(&ctx, &state, body).await;
-    match result {
-        Ok(response) => response,
-        Err(e) => error_response_for_method(e, &method, &ctx.request_id),
-    }
+    handle_request(&state, method, uri, headers, params, query, body).await
 }
 
 /// Routes service-level requests.
