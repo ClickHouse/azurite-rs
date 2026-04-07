@@ -51,7 +51,7 @@ pub async fn download_blob(
         let length = actual_end - start + 1;
 
         // Read range from extents
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(length as usize);
         let mut bytes_read = 0u64;
         let mut current_pos = 0u64;
 
@@ -87,7 +87,7 @@ pub async fn download_blob(
         (Bytes::from(result), StatusCode::PARTIAL_CONTENT, Some(range_str))
     } else {
         // Read full blob
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(blob.properties.content_length as usize);
         for chunk in &blob.extent_chunks {
             let data = extents.read(chunk).await?;
             result.extend_from_slice(&data);

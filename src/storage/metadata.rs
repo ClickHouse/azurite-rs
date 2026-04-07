@@ -306,17 +306,18 @@ impl MetadataStore for MemoryMetadataStore {
         name: &str,
         snapshot: &str,
     ) -> StorageResult<BlobModel> {
-        // First check if container exists
-        if !self.container_exists(account, container).await {
-            return Err(StorageError::new(ErrorCode::ContainerNotFound));
-        }
-
         let key = Self::blob_key(account, container, name, snapshot);
-        self.blobs
-            .get(&key)
-            .filter(|b| !b.deleted)
-            .map(|b| b.value().clone())
-            .ok_or_else(|| StorageError::new(ErrorCode::BlobNotFound))
+        match self.blobs.get(&key) {
+            Some(entry) if !entry.deleted => Ok(entry.value().clone()),
+            Some(_) | None => {
+                // Blob not found — distinguish ContainerNotFound vs BlobNotFound
+                if !self.container_exists(account, container).await {
+                    Err(StorageError::new(ErrorCode::ContainerNotFound))
+                } else {
+                    Err(StorageError::new(ErrorCode::BlobNotFound))
+                }
+            }
+        }
     }
 
     async fn update_blob(&self, blob: BlobModel) -> StorageResult<()> {
@@ -332,27 +333,28 @@ impl MetadataStore for MemoryMetadataStore {
         name: &str,
         snapshot: &str,
     ) -> StorageResult<()> {
-        // First check if container exists
-        if !self.container_exists(account, container).await {
-            return Err(StorageError::new(ErrorCode::ContainerNotFound));
-        }
-
         let key = Self::blob_key(account, container, name, snapshot);
 
         // Remove from main store
-        let removed = self.blobs.remove(&key);
-
-        // Update secondary index if this was the base blob (not a snapshot)
-        if snapshot.is_empty() {
-            let index_key = (Self::arc_str(account), Self::arc_str(container));
-            if let Some(mut entry) = self.blob_index.get_mut(&index_key) {
-                entry.remove(name);
+        match self.blobs.remove(&key) {
+            Some(_) => {
+                // Update secondary index if this was the base blob (not a snapshot)
+                if snapshot.is_empty() {
+                    let index_key = (Self::arc_str(account), Self::arc_str(container));
+                    if let Some(mut entry) = self.blob_index.get_mut(&index_key) {
+                        entry.remove(name);
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                if !self.container_exists(account, container).await {
+                    Err(StorageError::new(ErrorCode::ContainerNotFound))
+                } else {
+                    Err(StorageError::new(ErrorCode::BlobNotFound))
+                }
             }
         }
-
-        removed
-            .map(|_| ())
-            .ok_or_else(|| StorageError::new(ErrorCode::BlobNotFound))
     }
 
     async fn list_blobs(
@@ -408,12 +410,11 @@ impl MetadataStore for MemoryMetadataStore {
         let mut sorted_names: Vec<_> = blob_names;
         sorted_names.sort();
 
-        // Fetch blobs and handle snapshots
+        // Fetch blobs — single pass, no double-lookup
         let empty_snapshot = Self::arc_str("");
-        let mut blobs: Vec<BlobModel> = Vec::new();
+        let mut blobs: Vec<BlobModel> = Vec::with_capacity(sorted_names.len());
 
         for name in &sorted_names {
-            // Get the base blob
             let key = (
                 account_arc.clone(),
                 container_arc.clone(),
@@ -426,22 +427,25 @@ impl MetadataStore for MemoryMetadataStore {
                     blobs.push(blob.clone());
                 }
             }
+        }
 
-            // If including snapshots, we need to scan for them
-            if include_snapshots {
-                // This requires scanning, but it's opt-in and less common
-                for entry in self.blobs.iter() {
-                    let (acct, cont, blob_name, snapshot) = entry.key();
-                    if acct.as_ref() == account
-                        && cont.as_ref() == container
-                        && blob_name.as_ref() == name.as_ref()
-                        && !snapshot.is_empty()
-                    {
-                        let blob = entry.value();
-                        if include_deleted || !blob.deleted {
-                            blobs.push(blob.clone());
-                        }
-                    }
+        // Snapshot scanning — only if requested, done as a single pass over all blobs
+        if include_snapshots && !sorted_names.is_empty() {
+            let name_set: HashSet<&str> = sorted_names.iter().map(|n| n.as_ref()).collect();
+            for entry in self.blobs.iter() {
+                let (acct, cont, blob_name, snapshot) = entry.key();
+                if snapshot.is_empty() {
+                    continue;
+                }
+                if acct.as_ref() != account || cont.as_ref() != container {
+                    continue;
+                }
+                if !name_set.contains(blob_name.as_ref()) {
+                    continue;
+                }
+                let blob = entry.value();
+                if include_deleted || !blob.deleted {
+                    blobs.push(blob.clone());
                 }
             }
         }
