@@ -2,7 +2,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, Method, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::{delete, get, head, post, put},
@@ -57,6 +57,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/:account/:container", get(container_handler).put(container_handler).delete(container_handler).head(container_handler).post(container_handler))
         // Blob-level routes (with catch-all for blob path)
         .route("/:account/:container/*blob", get(blob_handler).put(blob_handler).delete(blob_handler).head(blob_handler).post(blob_handler))
+        // Disable the default 2 MiB body size limit; blob uploads can be up to 5000 MiB.
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
