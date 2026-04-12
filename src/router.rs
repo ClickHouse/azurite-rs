@@ -77,7 +77,7 @@ async fn handle_request(
     let req_id = REQ_ID.fetch_add(1, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let path = uri.path().to_string();
-    eprintln!("[{}] > {} {}", req_id, method, path);
+    tracing::info!("[{}] > {} {}", req_id, method, path);
 
     let ctx = match RequestContext::new(method.clone(), uri, headers, params, query) {
         Ok(ctx) => ctx,
@@ -110,11 +110,11 @@ async fn handle_request(
     resp
 }
 
-/// Log request completion to stderr (always visible, even in --silent mode).
+/// Log request completion.
 #[inline]
 fn log_request(req_id: u64, method: &Method, path: &str, status: u16, t0: std::time::Instant) {
     let elapsed = t0.elapsed();
-    eprintln!(
+    tracing::info!(
         "[{}] < {} {} {} {:.1}ms",
         req_id, method, path, status, elapsed.as_secs_f64() * 1000.0
     );
