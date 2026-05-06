@@ -27,6 +27,10 @@ pub trait MetadataStore: Send + Sync {
 
     // Blob operations
     async fn create_blob(&self, blob: BlobModel) -> StorageResult<()>;
+    /// Insert or replace a blob, returning the previous blob if one existed
+    /// at the same key. Callers use the returned old blob to free orphaned
+    /// extents that the new blob no longer references.
+    async fn put_blob(&self, blob: BlobModel) -> StorageResult<Option<BlobModel>>;
     async fn get_blob(
         &self,
         account: &str,
@@ -42,6 +46,13 @@ pub trait MetadataStore: Send + Sync {
         name: &str,
         snapshot: &str,
     ) -> StorageResult<()>;
+    /// Take all blobs in a container (returning them and removing from the
+    /// store). Used by `delete_container` so the caller can free their extents.
+    async fn take_container_blobs(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> StorageResult<Vec<BlobModel>>;
     async fn list_blobs(
         &self,
         account: &str,
@@ -62,7 +73,9 @@ pub trait MetadataStore: Send + Sync {
     ) -> bool;
 
     // Block operations
-    async fn stage_block(&self, block: BlockModel) -> StorageResult<()>;
+    /// Stage a block. If a block with the same id is already staged, returns
+    /// the previous one so the caller can free its extent.
+    async fn stage_block(&self, block: BlockModel) -> StorageResult<Option<BlockModel>>;
     async fn get_staged_blocks(
         &self,
         account: &str,
@@ -76,12 +89,15 @@ pub trait MetadataStore: Send + Sync {
         blob: &str,
         block_id: &str,
     ) -> StorageResult<BlockModel>;
+    /// Removes all staged blocks for a blob and returns them, so the caller
+    /// can decide which extents to free (those not referenced by the
+    /// freshly-committed blob).
     async fn delete_staged_blocks(
         &self,
         account: &str,
         container: &str,
         blob: &str,
-    ) -> StorageResult<()>;
+    ) -> StorageResult<Vec<BlockModel>>;
 
     // Service properties
     async fn get_service_properties(&self, account: &str) -> StorageResult<ServiceProperties>;
@@ -211,6 +227,106 @@ impl MetadataStore for MemoryMetadataStore {
             .ok_or_else(|| StorageError::new(ErrorCode::ContainerNotFound))
     }
 
+    async fn take_container_blobs(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> StorageResult<Vec<BlobModel>> {
+        let account_arc = Self::arc_str(account);
+        let container_arc = Self::arc_str(container);
+        let index_key = (account_arc.clone(), container_arc.clone());
+
+        // Snapshot the names from the secondary index, then drop it.
+        let names: Vec<Arc<str>> = self
+            .blob_index
+            .remove(&index_key)
+            .map(|(_, set)| set.into_iter().collect())
+            .unwrap_or_default();
+
+        // Remove all base + snapshot variants for each name. Snapshots are
+        // not in the index, so we sweep the blob map for matching keys.
+        let mut taken = Vec::with_capacity(names.len());
+        for name in &names {
+            // Base blob (snapshot == "").
+            let base_key = (
+                account_arc.clone(),
+                container_arc.clone(),
+                name.clone(),
+                Self::arc_str(""),
+            );
+            if let Some((_, blob)) = self.blobs.remove(&base_key) {
+                taken.push(blob);
+            }
+        }
+
+        // Sweep snapshots for blobs in this container. Snapshots are rare in
+        // ClickHouse workloads, so the extra scan is acceptable.
+        let snapshot_keys: Vec<BlobKey> = self
+            .blobs
+            .iter()
+            .filter_map(|entry| {
+                let (acct, cont, _, snapshot) = entry.key();
+                if !snapshot.is_empty()
+                    && acct.as_ref() == account
+                    && cont.as_ref() == container
+                {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in snapshot_keys {
+            if let Some((_, blob)) = self.blobs.remove(&key) {
+                taken.push(blob);
+            }
+        }
+
+        // Also drop any staged blocks for this container so their extents
+        // can be freed by the caller.
+        let block_index_keys: Vec<(Arc<str>, Arc<str>, Arc<str>)> = self
+            .block_index
+            .iter()
+            .filter_map(|entry| {
+                let (acct, cont, _) = entry.key();
+                if acct.as_ref() == account && cont.as_ref() == container {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for index_key in block_index_keys {
+            if let Some((_, ids)) = self.block_index.remove(&index_key) {
+                let (account_arc, container_arc, blob_arc) = index_key;
+                for block_id in ids {
+                    let key = (
+                        account_arc.clone(),
+                        container_arc.clone(),
+                        blob_arc.clone(),
+                        block_id,
+                    );
+                    if let Some((_, block)) = self.blocks.remove(&key) {
+                        // Represent staged blocks as zero-extent blob shells
+                        // so the caller can free their data via the same
+                        // extent_chunks path.
+                        let mut shim = BlobModel::new(
+                            block.account.clone(),
+                            block.container.clone(),
+                            block.blob.clone(),
+                            crate::models::BlobType::BlockBlob,
+                            0,
+                        );
+                        shim.extent_chunks = vec![block.extent_chunk];
+                        taken.push(shim);
+                    }
+                }
+            }
+        }
+
+        Ok(taken)
+    }
+
     async fn list_containers(
         &self,
         account: &str,
@@ -285,18 +401,26 @@ impl MetadataStore for MemoryMetadataStore {
     }
 
     async fn create_blob(&self, blob: BlobModel) -> StorageResult<()> {
+        let _ = self.put_blob(blob).await?;
+        Ok(())
+    }
+
+    async fn put_blob(&self, blob: BlobModel) -> StorageResult<Option<BlobModel>> {
         let key = Self::blob_key(&blob.account, &blob.container, &blob.name, &blob.snapshot);
         let index_key = (Self::arc_str(&blob.account), Self::arc_str(&blob.container));
         let blob_name = Self::arc_str(&blob.name);
 
-        // Update the secondary index
-        self.blob_index
-            .entry(index_key)
-            .or_default()
-            .insert(blob_name);
+        // Update the secondary index. Only base blobs (snapshot == "") are
+        // tracked in the per-container blob_index used by list_blobs.
+        if blob.snapshot.is_empty() {
+            self.blob_index
+                .entry(index_key)
+                .or_default()
+                .insert(blob_name);
+        }
 
-        self.blobs.insert(key, blob);
-        Ok(())
+        // Returns Some(old) when this insert replaced an existing blob.
+        Ok(self.blobs.insert(key, blob))
     }
 
     async fn get_blob(
@@ -498,7 +622,7 @@ impl MetadataStore for MemoryMetadataStore {
         self.blobs.get(&key).map(|b| !b.deleted).unwrap_or(false)
     }
 
-    async fn stage_block(&self, block: BlockModel) -> StorageResult<()> {
+    async fn stage_block(&self, block: BlockModel) -> StorageResult<Option<BlockModel>> {
         let key = Self::block_key(
             &block.account,
             &block.container,
@@ -518,8 +642,9 @@ impl MetadataStore for MemoryMetadataStore {
             .or_default()
             .insert(block_id);
 
-        self.blocks.insert(key, block);
-        Ok(())
+        // Returns Some(old) when re-staging the same block id replaces a
+        // previous stage; the caller then frees the old extent.
+        Ok(self.blocks.insert(key, block))
     }
 
     async fn get_staged_blocks(
@@ -581,7 +706,7 @@ impl MetadataStore for MemoryMetadataStore {
         account: &str,
         container: &str,
         blob: &str,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<BlockModel>> {
         let index_key = (
             Self::arc_str(account),
             Self::arc_str(container),
@@ -595,11 +720,13 @@ impl MetadataStore for MemoryMetadataStore {
             .map(|(_, set)| set.into_iter().collect())
             .unwrap_or_default();
 
-        // Remove blocks from main store
+        // Remove blocks from main store, returning them so callers can decide
+        // which extents to free.
         let account_arc = Self::arc_str(account);
         let container_arc = Self::arc_str(container);
         let blob_arc = Self::arc_str(blob);
 
+        let mut removed = Vec::with_capacity(block_ids.len());
         for block_id in block_ids {
             let key = (
                 account_arc.clone(),
@@ -607,10 +734,12 @@ impl MetadataStore for MemoryMetadataStore {
                 blob_arc.clone(),
                 block_id,
             );
-            self.blocks.remove(&key);
+            if let Some((_, block)) = self.blocks.remove(&key) {
+                removed.push(block);
+            }
         }
 
-        Ok(())
+        Ok(removed)
     }
 
     async fn get_service_properties(&self, account: &str) -> StorageResult<ServiceProperties> {

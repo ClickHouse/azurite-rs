@@ -13,7 +13,7 @@ use crate::error::{ErrorCode, StorageError, StorageResult};
 use crate::models::{
     ContainerModel, LeaseDuration, LeaseState, LeaseStatus, PublicAccessLevel,
 };
-use crate::storage::MetadataStore;
+use crate::storage::{ExtentStore, MetadataStore};
 use crate::xml::{
     deserialize::parse_signed_identifiers,
     serialize::{serialize_blob_list, serialize_signed_identifiers},
@@ -61,6 +61,7 @@ pub async fn create_container(
 pub async fn delete_container(
     ctx: &RequestContext,
     metadata: Arc<dyn MetadataStore>,
+    extents: Arc<dyn ExtentStore>,
 ) -> StorageResult<Response<Body>> {
     let container_name = ctx
         .container
@@ -71,7 +72,18 @@ pub async fn delete_container(
     let container = metadata.get_container(&ctx.account, container_name).await?;
     check_container_lease(&container, ctx.lease_id())?;
 
+    // Take all blobs and staged blocks in this container so we can free their
+    // extents — without this, deleting a container leaves all its blob data
+    // behind in the extent store forever.
+    let blobs = metadata
+        .take_container_blobs(&ctx.account, container_name)
+        .await?;
     metadata.delete_container(&ctx.account, container_name).await?;
+    for blob in blobs {
+        for chunk in &blob.extent_chunks {
+            let _ = extents.delete(&chunk.id).await;
+        }
+    }
 
     let headers = common_headers();
 

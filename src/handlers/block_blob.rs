@@ -15,7 +15,7 @@ use crate::models::{BlobModel, BlobType, BlockModel, BlockState, ExtentChunk};
 use crate::storage::{ExtentStore, MetadataStore};
 use crate::xml::{deserialize::BlockListRequest, serialize::serialize_block_list};
 
-use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers};
+use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers, put_blob_release_extents};
 
 /// PUT /{container}/{blob} - Upload block blob (single PUT).
 pub async fn upload_block_blob(
@@ -103,13 +103,17 @@ pub async fn upload_block_blob(
         blob.extent_chunks = vec![chunk];
     }
 
-    // Create or update blob
-    metadata.create_blob(blob.clone()).await?;
+    // Create or replace blob, freeing any extents the previous blob owned.
+    put_blob_release_extents(&metadata, &extents, blob.clone()).await?;
 
-    // Clear any staged blocks for this blob
-    metadata
+    // Clear any staged blocks for this blob and free their extents — none
+    // of them are referenced by a single-PUT block blob.
+    let dropped_blocks = metadata
         .delete_staged_blocks(&ctx.account, container, blob_name)
         .await?;
+    for block in dropped_blocks {
+        let _ = extents.delete(&block.extent_chunk.id).await;
+    }
 
     let mut headers = common_headers();
     add_blob_headers(
@@ -191,8 +195,11 @@ pub async fn stage_block(
         extent_chunk,
     );
 
-    // Stage the block
-    metadata.stage_block(block).await?;
+    // Stage the block. If a previous stage had used the same block id, free
+    // its extent so the data does not leak.
+    if let Some(prev) = metadata.stage_block(block).await? {
+        let _ = extents.delete(&prev.extent_chunk.id).await;
+    }
 
     let mut headers = common_headers();
     headers.insert(
@@ -327,13 +334,25 @@ pub async fn commit_block_list(
         blob.metadata = request_metadata;
     }
 
-    // Save blob
-    metadata.create_blob(blob.clone()).await?;
+    // Save blob, freeing any extents previously held by an earlier version.
+    put_blob_release_extents(&metadata, &extents, blob.clone()).await?;
 
-    // Clear staged blocks
-    metadata
+    // Clear staged blocks. Free extents for any staged block that was NOT
+    // pulled into the committed blob (uncommitted stages would otherwise
+    // leak forever).
+    let committed_extent_ids: std::collections::HashSet<&str> = blob
+        .extent_chunks
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    let dropped_blocks = metadata
         .delete_staged_blocks(&ctx.account, container, blob_name)
         .await?;
+    for block in dropped_blocks {
+        if !committed_extent_ids.contains(block.extent_chunk.id.as_str()) {
+            let _ = extents.delete(&block.extent_chunk.id).await;
+        }
+    }
 
     let mut headers = common_headers();
     add_blob_headers(

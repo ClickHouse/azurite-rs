@@ -19,9 +19,14 @@ pub use service::*;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use chrono::Utc;
+use std::collections::HashSet;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::context::format_http_date;
+use crate::error::StorageResult;
+use crate::models::BlobModel;
+use crate::storage::{ExtentStore, MetadataStore};
 
 /// Creates common response headers for Azure Blob Storage API responses.
 pub fn common_headers() -> HeaderMap {
@@ -47,4 +52,28 @@ pub fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Res
         .unwrap();
     *response.headers_mut() = headers;
     response
+}
+
+/// Saves `blob` (creating or replacing) and decrements refcounts for any
+/// extents that the previous blob referenced but the new blob does not.
+/// This is the central place to prevent extent leaks on overwrite.
+pub async fn put_blob_release_extents(
+    metadata: &Arc<dyn MetadataStore>,
+    extents: &Arc<dyn ExtentStore>,
+    blob: BlobModel,
+) -> StorageResult<()> {
+    let new_extent_ids: HashSet<String> = blob
+        .extent_chunks
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    let old = metadata.put_blob(blob).await?;
+    if let Some(old) = old {
+        for chunk in &old.extent_chunks {
+            if !new_extent_ids.contains(&chunk.id) {
+                let _ = extents.delete(&chunk.id).await;
+            }
+        }
+    }
+    Ok(())
 }

@@ -17,7 +17,7 @@ use crate::models::{
 use crate::storage::{ExtentStore, MetadataStore};
 use crate::xml::{deserialize::parse_tags, serialize::serialize_tags};
 
-use super::{add_blob_headers, build_response, common_headers};
+use super::{add_blob_headers, build_response, common_headers, put_blob_release_extents};
 
 /// GET /{container}/{blob} - Download blob.
 pub async fn download_blob(
@@ -405,6 +405,7 @@ pub async fn set_blob_metadata(
 pub async fn create_snapshot(
     ctx: &RequestContext,
     metadata: Arc<dyn MetadataStore>,
+    extents: Arc<dyn ExtentStore>,
 ) -> StorageResult<Response<Body>> {
     let container = ctx.container.as_ref().ok_or_else(|| StorageError::new(ErrorCode::ContainerNotFound))?;
     let blob_name = ctx.blob.as_ref().ok_or_else(|| StorageError::new(ErrorCode::BlobNotFound))?;
@@ -428,7 +429,15 @@ pub async fn create_snapshot(
         snapshot.metadata = request_metadata;
     }
 
-    metadata.create_blob(snapshot.clone()).await?;
+    // Snapshots share extents with their base blob; add a refcount on each
+    // before persisting so that deleting the base does not free the data.
+    for chunk in &snapshot.extent_chunks {
+        let _ = extents.add_ref(&chunk.id).await;
+    }
+
+    // Snapshots have unique (snapshot != "") keys, so put_blob will not
+    // replace an existing entry — the freeing-old-extents path is harmless.
+    put_blob_release_extents(&metadata, &extents, snapshot.clone()).await?;
 
     let mut headers = common_headers();
     add_blob_headers(&mut headers, &snapshot.properties.etag, &snapshot.properties.last_modified);
@@ -697,13 +706,12 @@ pub async fn copy_blob(
     dest_blob.properties.content_disposition = source_blob.properties.content_disposition.clone();
     dest_blob.properties.cache_control = source_blob.properties.cache_control.clone();
 
-    // Copy extent references (for same-account copies)
-    if source_parts.account == ctx.account {
-        dest_blob.extent_chunks = source_blob.extent_chunks.clone();
-    } else {
-        // For cross-account copies, we would need to copy the actual data
-        // For simplicity, we'll just reference the same extents
-        dest_blob.extent_chunks = source_blob.extent_chunks.clone();
+    // Copy extent references. The destination shares the same extent IDs as
+    // the source, so we add a refcount on each shared extent. Without this,
+    // deleting the destination would free data that the source still owns.
+    dest_blob.extent_chunks = source_blob.extent_chunks.clone();
+    for chunk in &dest_blob.extent_chunks {
+        let _ = extents.add_ref(&chunk.id).await;
     }
 
     // Set copy metadata
@@ -724,7 +732,9 @@ pub async fn copy_blob(
         request_metadata
     };
 
-    metadata.create_blob(dest_blob.clone()).await?;
+    // Replace any existing destination, freeing its previous (now-orphaned)
+    // extents.
+    put_blob_release_extents(&metadata, &extents, dest_blob.clone()).await?;
 
     let mut headers = common_headers();
     add_blob_headers(

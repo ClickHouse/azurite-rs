@@ -12,7 +12,7 @@ use crate::error::{ErrorCode, StorageError, StorageResult};
 use crate::models::{BlobModel, BlobType};
 use crate::storage::{ExtentStore, MetadataStore};
 
-use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers};
+use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers, put_blob_release_extents};
 
 /// Maximum number of append blocks (50,000).
 const MAX_APPEND_BLOCK_COUNT: u32 = 50_000;
@@ -23,6 +23,7 @@ const MAX_APPEND_BLOCK_SIZE: u64 = 100 * 1024 * 1024;
 pub async fn create_append_blob(
     ctx: &RequestContext,
     metadata: Arc<dyn MetadataStore>,
+    extents: Arc<dyn ExtentStore>,
 ) -> StorageResult<Response<Body>> {
     let container = ctx
         .container
@@ -86,8 +87,8 @@ pub async fn create_append_blob(
     // Set metadata
     blob.metadata = ctx.metadata();
 
-    // Create blob
-    metadata.create_blob(blob.clone()).await?;
+    // Create or replace blob, freeing any extents the previous blob owned.
+    put_blob_release_extents(&metadata, &extents, blob.clone()).await?;
 
     let mut headers = common_headers();
     add_blob_headers(

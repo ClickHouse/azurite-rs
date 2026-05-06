@@ -15,12 +15,13 @@ use crate::models::{
 use crate::storage::{ExtentStore, MetadataStore};
 use crate::xml::serialize::{serialize_page_ranges, serialize_page_ranges_diff};
 
-use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers};
+use super::{add_blob_headers, blob::check_blob_lease, build_response, common_headers, put_blob_release_extents};
 
 /// PUT /{container}/{blob} (x-ms-blob-type: PageBlob) - Create page blob.
 pub async fn create_page_blob(
     ctx: &RequestContext,
     metadata: Arc<dyn MetadataStore>,
+    extents: Arc<dyn ExtentStore>,
 ) -> StorageResult<Response<Body>> {
     let container = ctx
         .container
@@ -101,8 +102,8 @@ pub async fn create_page_blob(
     // Set metadata
     blob.metadata = ctx.metadata();
 
-    // Create blob
-    metadata.create_blob(blob.clone()).await?;
+    // Create or replace blob, freeing any extents the previous blob owned.
+    put_blob_release_extents(&metadata, &extents, blob.clone()).await?;
 
     let mut headers = common_headers();
     add_blob_headers(

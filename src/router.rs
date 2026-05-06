@@ -221,7 +221,7 @@ async fn route_container_request(
         }
         // Delete container
         ("DELETE", Some("container"), None) => {
-            handlers::delete_container(ctx, state.metadata.clone()).await
+            handlers::delete_container(ctx, state.metadata.clone(), state.extents.clone()).await
         }
         // Get container properties
         ("GET" | "HEAD", Some("container"), None) => {
@@ -293,10 +293,10 @@ async fn route_blob_request(
             } else {
                 match blob_type {
                     Some("PageBlob") => {
-                        handlers::create_page_blob(ctx, state.metadata.clone()).await
+                        handlers::create_page_blob(ctx, state.metadata.clone(), state.extents.clone()).await
                     }
                     Some("AppendBlob") => {
-                        handlers::create_append_blob(ctx, state.metadata.clone()).await
+                        handlers::create_append_blob(ctx, state.metadata.clone(), state.extents.clone()).await
                     }
                     _ => {
                         handlers::upload_block_blob(ctx, state.metadata.clone(), state.extents.clone(), body).await
@@ -370,7 +370,7 @@ async fn route_blob_request(
         }
         // Create snapshot
         ("PUT", Some("snapshot")) => {
-            handlers::create_snapshot(ctx, state.metadata.clone()).await
+            handlers::create_snapshot(ctx, state.metadata.clone(), state.extents.clone()).await
         }
         // Abort copy
         ("PUT", Some("copy")) => {
